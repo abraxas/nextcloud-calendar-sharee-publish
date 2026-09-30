@@ -16,18 +16,17 @@
 
 **Nextcloud Server** `35.0.0` - Nextcloud GmbH
 
-Unpublished Nextcloud source finding: CalDAV `PublishPlugin` only checks `{DAV:}write`. Owner-limit `limitAddressBookAndCalendarSharingToOwner` defaults to `no`. A colleague you gave **edit** on a calendar can publish it. Anyone with the secret URL reads your non-PRIVATE events with no login.
+CalDAV `PublishPlugin` only checks `{DAV:}write`. Owner-limit `limitAddressBookAndCalendarSharingToOwner` defaults to `no`. A colleague you gave **edit** on a calendar can publish it. Anyone with the secret URL reads your non-PRIVATE events with no login.
 
 **A bad actor with edit on your calendar can turn it into a public URL. Anyone who has that URL can read your meetings and attendees without logging in.**
 
 | | |
 |---|---|
-| ID | Unpublished Nextcloud source finding #4 (no CVE yet) |
+| ID | no CVE yet |
 | CWE | [CWE-284, CWE-862](https://cwe.mitre.org/data/definitions/284.html) |
 | CVSS | **High: 6.5** `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N` |
 | Product | [Nextcloud Server](https://github.com/nextcloud/server) |
 | Affected | **35.0.0** (`da02f41`) official `nextcloud:35.0.0-apache` |
-| Patched | vendor patch - see references |
 | Auth | write-sharee, then unauthenticated public read |
 | License | [GNU Affero GPL v3.0](LICENSE) |
 | Lab | `127.0.0.1` only |
@@ -49,13 +48,19 @@ Reshare of the calendar is forbidden. Publish is not. The owner-limit config exi
 
 ---
 
-## Advisory (from the source map)
+## How I found it
 
-`PublishPlugin.php` 191-207: `{DAV:}write` then `limitAddressBookAndCalendarSharingToOwner` default `no`. `Calendar.php` forbids reshare when `isShared()`; write ACL still grants `{DAV:}write` to edit-sharees. `CalDavBackend::setPublishStatus` inserts `ACCESS_PUBLIC`.
+`PublishPlugin` checks `{DAV:}write`, then `dav` / `limitAddressBookAndCalendarSharingToOwner`, which defaults to `no`. `Calendar::updateShares` forbids **reshare** when `isShared()`. Publish is a different verb. Write ACL still grants `{DAV:}write` to an edit-sharee.
+
+I stood up official `nextcloud:35.0.0-apache`. Owner calendar `labcal` with a non-PRIVATE event SUMMARY `NEXTCLOUD-CAL-SHAREE-PUBLISH-WITNESS`.
+
+First I sent `MKCALENDAR`. Sabre came back **405** `MethodNotAllowed`. I PUT the VEVENT anyway. **201**. The calendar was there. The collection-create verb was the wrong door, not the wrong house.
+
+Shared read-write to `sharee`. Sharee POST `CS:publish-calendar` returned **202**. Unauth PROPFIND on the public URL contained the witness.
 
 ---
 
-## Reproduction (authorized lab)
+## Lab
 
 ```bash
 cd lab
@@ -64,28 +69,25 @@ cd lab
 
 Target **only** `http://127.0.0.1:18344`.
 
-Success last line:
-
 ```text
 SUCCESS NEXTCLOUD-CAL-SHAREE-PUBLISH who=write-sharee unauth-read=yes NEXTCLOUD-CAL-SHAREE-PUBLISH-WITNESS
 ```
-
----
-
-## Lab images
 
 - [`lab/docker-compose.yml`](lab/docker-compose.yml)
 - [`lab/Dockerfile`](lab/Dockerfile)
 - [`lab/run.sh`](lab/run.sh)
 
-Publish nothing except `127.0.0.1`.
+---
+
+## The fix
+
+Require the owner principal for publish, or default the owner-limit on **and** still deny publish for `isShared()` calendars. Reshare is already forbidden. Publish should follow it.
 
 ---
 
 ## References
 
 - [github.com/nextcloud/server](https://github.com/nextcloud/server) tag [v35.0.0](https://github.com/nextcloud/server/releases/tag/v35.0.0)
-- Vendor intake: [hackerone.com/nextcloud](https://hackerone.com/nextcloud). Do **not** open a public GitHub issue.
 - Abraxas Labs: [abraxaslabs.tech](https://abraxaslabs.tech) · [github.com/abraxas](https://github.com/abraxas) · [@abraxas_null](https://x.com/abraxas_null)
 
 ---
