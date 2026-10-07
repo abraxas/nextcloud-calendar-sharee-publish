@@ -234,7 +234,6 @@ non-PRIVATE event.
 
 Loopback only. No shells. CardDAV out of scope.
 """
-from __future__ import annotations
 
 import base64
 import json
@@ -242,29 +241,70 @@ import os
 import re
 import subprocess
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-HERE = Path(__file__).resolve().parent
-BASE = os.environ.get("NC_URL", "http://127.0.0.1:18344").rstrip("/")
-ADMIN = os.environ.get("NC_ADMIN_USER", "admin")
-ADMIN_PASS = os.environ.get("NC_ADMIN_PASSWORD", "LabAdmin35!")
-OWNER = os.environ.get("NC_OWNER_USER", "owner")
-OWNER_PASS = os.environ.get("NC_OWNER_PASSWORD", "LabOwner35!")
-SHAREE = os.environ.get("NC_SHAREE_USER", "sharee")
-SHAREE_PASS = os.environ.get("NC_SHAREE_PASSWORD", "LabSharee35!")
+LABEL = "NEXTCLOUD-CAL-SHAREE-PUBLISH"
 WITNESS = "NEXTCLOUD-CAL-SHAREE-PUBLISH-WITNESS"
 CAL_URI = "labcal"
-COMPOSE_PROJECT = os.environ.get("COMPOSE_PROJECT_NAME", "nextcloud-calendar-sharee-publish")
-NS = {
-    "d": "DAV:",
-    "cs": "http://calendarserver.org/ns/",
-    "c": "urn:ietf:params:xml:ns:caldav",
-    "oc": "http://owncloud.org/ns",
-}
+DEFAULT_BASE = "http://127.0.0.1:18344"
+DEFAULT_COMPOSE_PROJECT = "nextcloud-calendar-sharee-publish"
+USER_AGENT = "nextcloud-calendar-sharee-publish-lab"
 
-MKCALENDAR_BODY = """<?xml version="1.0" encoding="utf-8" ?>
+HTTP_TIMEOUT_SECS = 60.0
+OCC_TIMEOUT_SECS = 60
+SNIPPET_SHORT = 200
+SNIPPET_MED = 240
+SNIPPET_BODY = 300
+SNIPPET_LONG = 400
+SNIPPET_URL = 500
+
+XML_CONTENT_TYPE = "application/xml; charset=utf-8"
+ICS_CONTENT_TYPE = "text/calendar; charset=utf-8"
+
+DAV_OK = (200, 201, 204)
+DAV_LIST_OK = (200, 207)
+MKCALENDAR_OK = (200, 201, 204, 405, 409)
+PUT_OK = (200, 201, 204)
+OCS_LOGIN_OK = (200, 201)
+PUBLISH_ACCEPTED = 202
+HTTP_FORBIDDEN = 403
+SABRE_OK = "everything-went-well"
+LIMIT_OWNER_YES = "yes"
+
+PUBLIC_CAL_RE = re.compile(r"public-calendars/([^/?#]+)")
+PUBLIC_CAL_BODY_RE = re.compile(r"public-calendars/([^/?#<\s]+)")
+
+
+@dataclass(frozen=True)
+class LabConfig:
+    base: str
+    owner_user: str
+    owner_password: str
+    sharee_user: str
+    sharee_password: str
+    compose_project: str
+    lab_dir: Path
+
+    @classmethod
+    def from_env(cls) -> LabConfig:
+        return cls(
+            base=os.environ.get("NC_URL", DEFAULT_BASE).rstrip("/"),
+            owner_user=os.environ.get("NC_OWNER_USER", "owner"),
+            owner_password=os.environ.get("NC_OWNER_PASSWORD", "LabOwner35!"),
+            sharee_user=os.environ.get("NC_SHAREE_USER", "sharee"),
+            sharee_password=os.environ.get("NC_SHAREE_PASSWORD", "LabSharee35!"),
+            compose_project=os.environ.get("COMPOSE_PROJECT_NAME", DEFAULT_COMPOSE_PROJECT),
+            lab_dir=Path(__file__).resolve().parent,
+        )
+
+
+CFG = LabConfig.from_env()
+
+MKCALENDAR_BODY = b"""<?xml version="1.0" encoding="utf-8" ?>
 <c:mkcalendar xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:d="DAV:" xmlns:a="http://apple.com/ns/ical/" xmlns:o="http://owncloud.org/ns">
   <d:set>
     <d:prop>
@@ -277,17 +317,7 @@ MKCALENDAR_BODY = """<?xml version="1.0" encoding="utf-8" ?>
     </d:prop>
   </d:set>
 </c:mkcalendar>
-""".encode()
-
-SHARE_BODY = f"""<?xml version="1.0" encoding="utf-8" ?>
-<CS:share xmlns:D="DAV:" xmlns:CS="http://owncloud.org/ns">
-  <CS:set>
-    <D:href>principal:principals/users/{SHAREE}</D:href>
-    <CS:summary>lab share write</CS:summary>
-    <CS:read-write/>
-  </CS:set>
-</CS:share>
-""".encode()
+"""
 
 PUBLISH_BODY = b"""<?xml version="1.0" encoding="utf-8" ?>
 <CS:publish-calendar xmlns:CS="http://calendarserver.org/ns/" />
@@ -345,13 +375,33 @@ END:VCALENDAR
 """.replace("\n", "\r\n").encode()
 
 
-def fail(msg: str) -> None:
-    print(f"FAIL NEXTCLOUD-CAL-SHAREE-PUBLISH {msg}", flush=True)
+def share_body(sharee: str) -> bytes:
+    return f"""<?xml version="1.0" encoding="utf-8" ?>
+<CS:share xmlns:D="DAV:" xmlns:CS="http://owncloud.org/ns">
+  <CS:set>
+    <D:href>principal:principals/users/{sharee}</D:href>
+    <CS:summary>lab share write</CS:summary>
+    <CS:read-write/>
+  </CS:set>
+</CS:share>
+""".encode()
+
+
+def xml_headers(*, depth: str | None = None) -> dict[str, str]:
+    hdrs = {"Content-Type": XML_CONTENT_TYPE}
+    if depth is not None:
+        hdrs["Depth"] = depth
+    return hdrs
+
+
+def fail(reason: str) -> NoReturn:
+    print(f"FAIL {LABEL} {reason}", flush=True)
     raise SystemExit(1)
 
 
 def basic(user: str, password: str) -> str:
-    return "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+    token = base64.b64encode(f"{user}:{password}".encode()).decode()
+    return f"Basic {token}"
 
 
 def http(
@@ -360,9 +410,9 @@ def http(
     *,
     data: bytes | None = None,
     headers: dict[str, str] | None = None,
-    timeout: float = 60.0,
+    timeout: float = HTTP_TIMEOUT_SECS,
 ) -> tuple[int, dict[str, str], bytes]:
-    hdrs = {"User-Agent": "nextcloud-calendar-sharee-publish-lab"}
+    hdrs = {"User-Agent": USER_AGENT}
     if headers:
         hdrs.update(headers)
     req = Request(url, data=data, headers=hdrs, method=method)
@@ -374,7 +424,6 @@ def http(
         return exc.code, {k.lower(): v for k, v in exc.headers.items()}, exc.read()
     except URLError as exc:
         fail(f"http {method} {url} error {exc}")
-    return 0, {}, b""
 
 
 def ocs(method: str, path: str, user: str, password: str) -> tuple[int, dict]:
@@ -384,13 +433,13 @@ def ocs(method: str, path: str, user: str, password: str) -> tuple[int, dict]:
         "Authorization": basic(user, password),
     }
     sep = "&" if "?" in path else "?"
-    url = BASE + path + sep + "format=json"
+    url = f"{CFG.base}{path}{sep}format=json"
     code, _, raw = http(method, url, headers=hdrs)
     text = raw.decode("utf-8", "replace")
     try:
         parsed = json.loads(text) if text else {}
     except json.JSONDecodeError:
-        fail(f"ocs {method} {path} http={code} not json body={text[:400]!r}")
+        fail(f"ocs {method} {path} http={code} not json body={text[:SNIPPET_LONG]!r}")
     return code, parsed if isinstance(parsed, dict) else {}
 
 
@@ -431,7 +480,7 @@ def dav(
         hdrs["Authorization"] = basic(user, password)
     if extra_headers:
         hdrs.update(extra_headers)
-    return http(method, BASE + path, data=data, headers=hdrs)
+    return http(method, CFG.base + path, data=data, headers=hdrs)
 
 
 def parse_xml(raw: bytes) -> ET.Element | None:
@@ -460,10 +509,23 @@ def xml_text(raw: bytes) -> str:
     return raw.decode("utf-8", "replace")
 
 
-def compose_occ(*args: str, timeout: int = 60) -> str:
+def compose_occ(*args: str, timeout: int = OCC_TIMEOUT_SECS) -> str:
     proc = subprocess.run(
-        ["docker", "compose", "-p", COMPOSE_PROJECT, "exec", "-T", "-u", "www-data", "nextcloud", "php", "occ", *args],
-        cwd=HERE,
+        [
+            "docker",
+            "compose",
+            "-p",
+            CFG.compose_project,
+            "exec",
+            "-T",
+            "-u",
+            "www-data",
+            "nextcloud",
+            "php",
+            "occ",
+            *args,
+        ],
+        cwd=CFG.lab_dir,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -474,163 +536,228 @@ def compose_occ(*args: str, timeout: int = 60) -> str:
 
 def extract_token(hrefs: list[str], body: str) -> str | None:
     for href in hrefs:
-        m = re.search(r"public-calendars/([^/?#]+)", href)
-        if m:
-            return m.group(1).rstrip("/")
-    m = re.search(r"public-calendars/([^/?#<\s]+)", body)
-    if m:
-        return m.group(1).rstrip("/")
+        match = PUBLIC_CAL_RE.search(href)
+        if match:
+            return match.group(1).rstrip("/")
+    match = PUBLIC_CAL_BODY_RE.search(body)
+    if match:
+        return match.group(1).rstrip("/")
     return None
 
 
 def pick_shared_calendar(hrefs: list[str]) -> str | None:
-    wanted = f"{CAL_URI}_shared_by_{OWNER}"
+    wanted = f"{CAL_URI}_shared_by_{CFG.owner_user}"
     for href in hrefs:
-        if wanted in href and "/inbox" not in href and "/outbox" not in href:
-            path = href
-            if "://" in path:
-                path = "/" + path.split("/", 3)[-1] if path.count("/") >= 3 else path
-                # href may be absolute; keep from /remote.php or /calendars
-                idx = path.find("/remote.php/")
+        if wanted not in href or "/inbox" in href or "/outbox" in href:
+            continue
+        path = href
+        if "://" in path:
+            path = "/" + path.split("/", 3)[-1] if path.count("/") >= 3 else path
+            idx = path.find("/remote.php/")
+            if idx >= 0:
+                path = path[idx:]
+            else:
+                idx = path.find("/calendars/")
                 if idx >= 0:
-                    path = path[idx:]
-                else:
-                    idx = path.find("/calendars/")
-                    if idx >= 0:
-                        path = "/remote.php/dav" + path[idx:]
-            if not path.startswith("/"):
-                path = "/remote.php/dav/calendars/" + SHAREE + "/" + path.lstrip("/")
-            if not path.endswith("/"):
-                path += "/"
-            return path
+                    path = "/remote.php/dav" + path[idx:]
+        if not path.startswith("/"):
+            path = f"/remote.php/dav/calendars/{CFG.sharee_user}/{path.lstrip('/')}"
+        if not path.endswith("/"):
+            path += "/"
+        return path
     return None
 
 
-def main() -> None:
-    print(f"IOC base={BASE} owner={OWNER} sharee={SHAREE} cal={CAL_URI}", flush=True)
+def shared_is_read_only(list_text: str) -> bool:
+    marker = f"{CAL_URI}_shared_by_{CFG.owner_user}"
+    if "read-only>true" not in list_text.lower() or marker not in list_text:
+        return False
+    owner = re.escape(CFG.owner_user)
+    pattern = rf"{re.escape(CAL_URI)}_shared_by_{owner}[\s\S]{{0,800}}read-only>\s*true"
+    return re.search(pattern, list_text.lower()) is not None
 
-    limit_out = compose_occ("config:app:get", "dav", "limitAddressBookAndCalendarSharingToOwner").strip()
+
+def ics_dav_path(href: str) -> str | None:
+    if not href.rstrip("/").endswith(".ics"):
+        return None
+    idx = href.find("/remote.php/")
+    if idx >= 0:
+        return href[idx:]
+    if href.startswith("/"):
+        return href
+    return None
+
+
+def unauth_contains_witness(
+    public_path: str,
+    unauth_body: bytes,
+) -> tuple[bool, int | None, str]:
+    unauth_text = xml_text(unauth_body)
+    report_code, _, report_body = dav(
+        "REPORT",
+        public_path + "/",
+        None,
+        None,
+        data=CALENDAR_QUERY,
+        extra_headers=xml_headers(depth="1"),
+    )
+    report_text = xml_text(report_body)
+    print(f"IOC unauth-report http={report_code} bytes={len(report_body)}", flush=True)
+    if WITNESS in report_text:
+        return True, report_code, report_text
+
+    child_hrefs = all_hrefs(parse_xml(unauth_body)) + all_hrefs(parse_xml(report_body))
+    for href in child_hrefs:
+        path = ics_dav_path(href)
+        if path is None:
+            continue
+        get_code, _, get_body = dav("GET", path, None, None)
+        get_text = xml_text(get_body)
+        print(f"IOC unauth-get http={get_code} path={path} bytes={len(get_body)}", flush=True)
+        if WITNESS in get_text:
+            return True, get_code, get_text
+    return False, None, unauth_text
+
+
+def run_lab() -> int:
+    print(
+        f"IOC base={CFG.base} owner={CFG.owner_user} sharee={CFG.sharee_user} cal={CAL_URI}",
+        flush=True,
+    )
+
+    limit_out = compose_occ(
+        "config:app:get",
+        "dav",
+        "limitAddressBookAndCalendarSharingToOwner",
+    ).strip()
     print(f"IOC dav-limitAddressBookAndCalendarSharingToOwner={limit_out!r}", flush=True)
-    if limit_out == "yes":
+    if limit_out == LIMIT_OWNER_YES:
         fail("limitAddressBookAndCalendarSharingToOwner=yes")
 
-    code, parsed = ocs("GET", "/ocs/v2.php/cloud/users/" + SHAREE, SHAREE, SHAREE_PASS)
+    code, parsed = ocs(
+        "GET",
+        "/ocs/v2.php/cloud/users/" + CFG.sharee_user,
+        CFG.sharee_user,
+        CFG.sharee_password,
+    )
     groups = groups_from_userinfo(parsed)
     print(f"IOC sharee-login http={code} groups={groups}", flush=True)
-    if code not in (200, 201):
+    if code not in OCS_LOGIN_OK:
         fail(f"sharee login/info http={code}")
     if "admin" in [g.lower() for g in groups]:
         fail("sharee is in admin group (wrong fixture)")
 
-    code, parsed = ocs("GET", "/ocs/v2.php/cloud/users/" + OWNER, OWNER, OWNER_PASS)
+    code, parsed = ocs(
+        "GET",
+        "/ocs/v2.php/cloud/users/" + CFG.owner_user,
+        CFG.owner_user,
+        CFG.owner_password,
+    )
     owner_groups = groups_from_userinfo(parsed)
     print(f"IOC owner-login http={code} groups={owner_groups}", flush=True)
-    if code not in (200, 201):
+    if code not in OCS_LOGIN_OK:
         fail(f"owner login/info http={code}")
 
-    cal_path = f"/remote.php/dav/calendars/{OWNER}/{CAL_URI}"
+    cal_path = f"/remote.php/dav/calendars/{CFG.owner_user}/{CAL_URI}"
     mk_code, _, mk_body = dav(
         "MKCALENDAR",
         cal_path,
-        OWNER,
-        OWNER_PASS,
+        CFG.owner_user,
+        CFG.owner_password,
         data=MKCALENDAR_BODY,
-        extra_headers={"Content-Type": "application/xml; charset=utf-8"},
+        extra_headers=xml_headers(),
     )
-    print(f"IOC mkcalendar http={mk_code} body={xml_text(mk_body)[:200]!r}", flush=True)
-    if mk_code not in (201, 204, 200, 405):
-        # occ may have created it already (405/already exists) or 201
-        if mk_code not in (409,):
-            fail(f"mkcalendar http={mk_code} body={xml_text(mk_body)[:300]!r}")
+    print(f"IOC mkcalendar http={mk_code} body={xml_text(mk_body)[:SNIPPET_SHORT]!r}", flush=True)
+    # 405/409: occ dav:create-calendar may have created labcal already.
+    if mk_code not in MKCALENDAR_OK:
+        fail(f"mkcalendar http={mk_code} body={xml_text(mk_body)[:SNIPPET_BODY]!r}")
 
     ev_path = f"{cal_path}/witness.ics"
     put_code, _, put_body = dav(
         "PUT",
         ev_path,
-        OWNER,
-        OWNER_PASS,
+        CFG.owner_user,
+        CFG.owner_password,
         data=EVENT_ICS,
-        extra_headers={"Content-Type": "text/calendar; charset=utf-8"},
+        extra_headers={"Content-Type": ICS_CONTENT_TYPE},
     )
-    print(f"IOC put-event http={put_code} body={xml_text(put_body)[:200]!r}", flush=True)
-    if put_code not in (201, 204, 200):
-        fail(f"put event http={put_code} body={xml_text(put_body)[:300]!r}")
+    print(f"IOC put-event http={put_code} body={xml_text(put_body)[:SNIPPET_SHORT]!r}", flush=True)
+    if put_code not in PUT_OK:
+        fail(f"put event http={put_code} body={xml_text(put_body)[:SNIPPET_BODY]!r}")
 
-    share_code, share_hdrs, share_body = dav(
+    share_code, share_hdrs, share_body_raw = dav(
         "POST",
         cal_path + "/",
-        OWNER,
-        OWNER_PASS,
-        data=SHARE_BODY,
-        extra_headers={"Content-Type": "application/xml; charset=utf-8"},
+        CFG.owner_user,
+        CFG.owner_password,
+        data=share_body(CFG.sharee_user),
+        extra_headers=xml_headers(),
     )
     sabre_share = share_hdrs.get("x-sabre-status", "")
     print(
-        f"IOC share http={share_code} sabre={sabre_share!r} body={xml_text(share_body)[:240]!r}",
+        f"IOC share http={share_code} sabre={sabre_share!r} "
+        f"body={xml_text(share_body_raw)[:SNIPPET_MED]!r}",
         flush=True,
     )
-    if share_code not in (200, 201, 204):
-        fail(f"share http={share_code} body={xml_text(share_body)[:400]!r}")
+    if share_code not in DAV_OK:
+        fail(f"share http={share_code} body={xml_text(share_body_raw)[:SNIPPET_LONG]!r}")
 
     list_code, _, list_body = dav(
         "PROPFIND",
-        f"/remote.php/dav/calendars/{SHAREE}/",
-        SHAREE,
-        SHAREE_PASS,
+        f"/remote.php/dav/calendars/{CFG.sharee_user}/",
+        CFG.sharee_user,
+        CFG.sharee_password,
         data=PROPFIND_CALDATA,
-        extra_headers={"Content-Type": "application/xml; charset=utf-8", "Depth": "1"},
+        extra_headers=xml_headers(depth="1"),
     )
     list_text = xml_text(list_body)
     hrefs = all_hrefs(parse_xml(list_body))
     print(f"IOC sharee-propfind http={list_code} hrefs={hrefs}", flush=True)
-    if list_code not in (207, 200):
-        fail(f"sharee calendar list http={list_code} body={list_text[:400]!r}")
+    if list_code not in DAV_LIST_OK:
+        fail(f"sharee calendar list http={list_code} body={list_text[:SNIPPET_LONG]!r}")
     shared_path = pick_shared_calendar(hrefs)
     if not shared_path:
         fail(f"shared calendar uri missing hrefs={hrefs}")
-    if "read-only>true" in list_text.lower() and f"{CAL_URI}_shared_by_{OWNER}" in list_text:
-        # oc:read-only true on the shared calendar means view-only share (wrong fixture)
-        shared_snip = list_text.lower()
-        if re.search(
-            rf"{re.escape(CAL_URI)}_shared_by_{re.escape(OWNER)}[\s\S]{{0,800}}read-only>\s*true",
-            shared_snip,
-        ):
-            fail("share was read-only")
+    if shared_is_read_only(list_text):
+        fail("share was read-only")
     print(f"IOC shared-calendar-uri={shared_path}", flush=True)
 
     pub_code, pub_hdrs, pub_body = dav(
         "POST",
         shared_path,
-        SHAREE,
-        SHAREE_PASS,
+        CFG.sharee_user,
+        CFG.sharee_password,
         data=PUBLISH_BODY,
-        extra_headers={"Content-Type": "application/xml; charset=utf-8"},
+        extra_headers=xml_headers(),
     )
     sabre = pub_hdrs.get("x-sabre-status", "")
     print(
-        f"IOC publish http={pub_code} sabre={sabre!r} body={xml_text(pub_body)[:300]!r}",
+        f"IOC publish http={pub_code} sabre={sabre!r} body={xml_text(pub_body)[:SNIPPET_BODY]!r}",
         flush=True,
     )
-    if pub_code == 403:
+    if pub_code == HTTP_FORBIDDEN:
         fail("POST 403")
-    if pub_code != 202:
-        fail(f"publish http={pub_code} sabre={sabre!r} body={xml_text(pub_body)[:400]!r}")
-    if sabre and sabre != "everything-went-well":
+    if pub_code != PUBLISH_ACCEPTED:
+        fail(f"publish http={pub_code} sabre={sabre!r} body={xml_text(pub_body)[:SNIPPET_LONG]!r}")
+    if sabre and sabre != SABRE_OK:
         fail(f"publish sabre={sabre!r}")
 
     url_code, _, url_body = dav(
         "PROPFIND",
         shared_path,
-        SHAREE,
-        SHAREE_PASS,
+        CFG.sharee_user,
+        CFG.sharee_password,
         data=PROPFIND_PUBLISH_URL,
-        extra_headers={"Content-Type": "application/xml; charset=utf-8", "Depth": "0"},
+        extra_headers=xml_headers(depth="0"),
     )
     url_text = xml_text(url_body)
     token = extract_token(all_hrefs(parse_xml(url_body)), url_text)
-    print(f"IOC publish-url http={url_code} token={token!r} body={url_text[:500]!r}", flush=True)
-    if url_code not in (207, 200) or not token:
-        fail(f"publish-url missing http={url_code} body={url_text[:400]!r}")
+    print(
+        f"IOC publish-url http={url_code} token={token!r} body={url_text[:SNIPPET_URL]!r}",
+        flush=True,
+    )
+    if url_code not in DAV_LIST_OK or not token:
+        fail(f"publish-url missing http={url_code} body={url_text[:SNIPPET_LONG]!r}")
 
     public_path = f"/remote.php/dav/public-calendars/{token}"
     unauth_code, unauth_hdrs, unauth_body = dav(
@@ -639,67 +766,43 @@ def main() -> None:
         None,
         None,
         data=PROPFIND_CALDATA,
-        extra_headers={"Content-Type": "application/xml; charset=utf-8", "Depth": "1"},
+        extra_headers=xml_headers(depth="1"),
     )
     unauth_text = xml_text(unauth_body)
     print(
-        f"IOC unauth-propfind http={unauth_code} sabre={unauth_hdrs.get('x-sabre-status', '')!r} bytes={len(unauth_body)}",
+        f"IOC unauth-propfind http={unauth_code} "
+        f"sabre={unauth_hdrs.get('x-sabre-status', '')!r} bytes={len(unauth_body)}",
         flush=True,
     )
 
     found = WITNESS in unauth_text
     if not found:
-        report_code, _, report_body = dav(
-            "REPORT",
-            public_path + "/",
-            None,
-            None,
-            data=CALENDAR_QUERY,
-            extra_headers={"Content-Type": "application/xml; charset=utf-8", "Depth": "1"},
-        )
-        report_text = xml_text(report_body)
-        print(f"IOC unauth-report http={report_code} bytes={len(report_body)}", flush=True)
-        if WITNESS in report_text:
-            found = True
-            unauth_text = report_text
-            unauth_code = report_code
-        else:
-            child_hrefs = all_hrefs(parse_xml(unauth_body)) + all_hrefs(parse_xml(report_body))
-            for href in child_hrefs:
-                if not href.rstrip("/").endswith(".ics"):
-                    continue
-                path = href
-                idx = path.find("/remote.php/")
-                if idx >= 0:
-                    path = path[idx:]
-                elif path.startswith("/"):
-                    pass
-                else:
-                    continue
-                get_code, _, get_body = dav("GET", path, None, None)
-                get_text = xml_text(get_body)
-                print(f"IOC unauth-get http={get_code} path={path} bytes={len(get_body)}", flush=True)
-                if WITNESS in get_text:
-                    found = True
-                    unauth_text = get_text
-                    unauth_code = get_code
-                    break
-
-    print(f"IOC unauth-read contains-witness={found} snippet={unauth_text[:400]!r}", flush=True)
-    if not found:
-        fail(f"unauth read missing witness http={unauth_code} body={unauth_text[:400]!r}")
+        found, extra_code, unauth_text = unauth_contains_witness(public_path, unauth_body)
+        if extra_code is not None:
+            unauth_code = extra_code
 
     print(
-        f"SUCCESS NEXTCLOUD-CAL-SHAREE-PUBLISH who=write-sharee unauth-read=yes {WITNESS}",
+        f"IOC unauth-read contains-witness={found} snippet={unauth_text[:SNIPPET_LONG]!r}",
         flush=True,
     )
+    if not found:
+        fail(f"unauth read missing witness http={unauth_code} body={unauth_text[:SNIPPET_LONG]!r}")
+
+    print(
+        f"SUCCESS {LABEL} who=write-sharee unauth-read=yes {WITNESS}",
+        flush=True,
+    )
+    return 0
 
 
-if __name__ == "__main__":
+def main() -> int:
     try:
-        main()
+        return run_lab()
     except SystemExit:
         raise
     except Exception as exc:
         fail(f"unhandled {type(exc).__name__}: {exc}")
 
+
+if __name__ == "__main__":
+    raise SystemExit(main())
