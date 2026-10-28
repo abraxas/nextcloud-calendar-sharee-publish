@@ -13,6 +13,10 @@
   &nbsp;·&nbsp;
   <a href="https://github.com/abraxas/nextcloud-calendar-sharee-publish">nextcloud-calendar-sharee-publish</a>
 </p>
+<p align="center">
+  Write-up: <a href="https://abraxaslabs.tech/research/nextcloud-calendar-sharee-publish"><strong>https://abraxaslabs.tech/research/nextcloud-calendar-sharee-publish</strong></a>
+</p>
+
 
 # nextcloud-calendar-sharee-publish
 
